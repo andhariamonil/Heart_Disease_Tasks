@@ -1,9 +1,4 @@
 
----
-
-# Task 2 - `README.md`
-
-````md
 # Heart Disease Prediction Using Machine Learning
 
 ## Task 2: Summary Statistics
