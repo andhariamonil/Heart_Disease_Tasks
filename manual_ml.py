@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import heapq
 import math
 import random
 from pathlib import Path
@@ -314,3 +315,193 @@ def roc_points(y_true: np.ndarray, scores: np.ndarray) -> tuple[list[float], lis
 
 def confusion_frame(matrix: np.ndarray) -> pd.DataFrame:
     return pd.DataFrame(matrix, index=["Actual 0", "Actual 1"], columns=["Predicted 0", "Predicted 1"])
+
+
+def kernel_matrix(x: np.ndarray, z: np.ndarray, kind: str, degree: int = 3, gamma: float | None = None, coef0: float = 1.0) -> np.ndarray:
+    """Build polynomial or RBF Gram matrices from their defining equations."""
+    dot_products = x @ z.T
+    if kind == "polynomial":
+        return (dot_products / x.shape[1] + coef0) ** degree
+    if kind == "rbf":
+        scale = gamma if gamma is not None else 1.0 / x.shape[1]
+        squared_norms_x = np.sum(x * x, axis=1)[:, None]
+        squared_norms_z = np.sum(z * z, axis=1)[None, :]
+        squared_distances = np.maximum(squared_norms_x + squared_norms_z - 2 * dot_products, 0.0)
+        return np.exp(-scale * squared_distances)
+    raise ValueError("kind must be 'polynomial' or 'rbf'")
+
+
+class KernelSVMScratch:
+    """Kernel SVM trained with manually implemented sequential minimal optimization."""
+
+    def __init__(self, kind: str, regularization: float = 1.0, epochs: int = 20, degree: int = 2, gamma: float | None = None):
+        if kind not in {"polynomial", "rbf"}:
+            raise ValueError("kind must be 'polynomial' or 'rbf'")
+        self.kind = kind
+        self.regularization = regularization
+        self.epochs = epochs
+        self.degree = degree
+        self.gamma = gamma
+
+    def fit(self, x: np.ndarray, y: np.ndarray) -> "KernelSVMScratch":
+        self.training_x = x.copy()
+        self.signed_y = np.where(y == 1, 1.0, -1.0)
+        gram = kernel_matrix(x, x, self.kind, self.degree, self.gamma)
+        self.coefficients = np.zeros(len(y), dtype=float)
+        self.bias = 0.0
+        errors = -self.signed_y.copy()
+        no_change_passes = 0
+        for _ in range(self.epochs):
+            changed = 0
+            for first in range(len(y)):
+                first_error = errors[first]
+                first_label = self.signed_y[first]
+                first_alpha = self.coefficients[first]
+                violates_margin = first_label * first_error < -1e-3 and first_alpha < self.regularization - 1e-8
+                can_shrink = first_label * first_error > 1e-3 and first_alpha > 1e-8
+                if not (violates_margin or can_shrink):
+                    continue
+
+                differences = np.abs(first_error - errors)
+                differences[first] = -1.0
+                second = int(np.argmax(differences))
+                second_error = errors[second]
+                second_label = self.signed_y[second]
+                first_old = self.coefficients[first]
+                second_old = self.coefficients[second]
+                if first_label != second_label:
+                    lower = max(0.0, second_old - first_old)
+                    upper = min(self.regularization, self.regularization + second_old - first_old)
+                else:
+                    lower = max(0.0, first_old + second_old - self.regularization)
+                    upper = min(self.regularization, first_old + second_old)
+                if upper - lower < 1e-10:
+                    continue
+
+                eta = 2 * gram[first, second] - gram[first, first] - gram[second, second]
+                if eta >= -1e-12:
+                    continue
+                second_new = second_old - second_label * (first_error - second_error) / eta
+                second_new = float(np.clip(second_new, lower, upper))
+                if abs(second_new - second_old) < 1e-6:
+                    continue
+                first_new = first_old + first_label * second_label * (second_old - second_new)
+                self.coefficients[first] = first_new
+                self.coefficients[second] = second_new
+
+                bias_first = self.bias - first_error - first_label * (first_new - first_old) * gram[first, first] - second_label * (second_new - second_old) * gram[first, second]
+                bias_second = self.bias - second_error - first_label * (first_new - first_old) * gram[first, second] - second_label * (second_new - second_old) * gram[second, second]
+                if 1e-8 < first_new < self.regularization - 1e-8:
+                    new_bias = bias_first
+                elif 1e-8 < second_new < self.regularization - 1e-8:
+                    new_bias = bias_second
+                else:
+                    new_bias = (bias_first + bias_second) / 2
+                errors += first_label * (first_new - first_old) * gram[:, first]
+                errors += second_label * (second_new - second_old) * gram[:, second]
+                errors += new_bias - self.bias
+                self.bias = float(new_bias)
+                changed += 1
+            no_change_passes = no_change_passes + 1 if changed == 0 else 0
+            if no_change_passes >= 3:
+                break
+        self.support_mask = self.coefficients > 1e-8
+        return self
+
+    def decision_function(self, x: np.ndarray) -> np.ndarray:
+        return kernel_matrix(x, self.training_x, self.kind, self.degree, self.gamma) @ (self.coefficients * self.signed_y) + self.bias
+
+    def predict(self, x: np.ndarray) -> np.ndarray:
+        return (self.decision_function(x) >= 0).astype(int)
+
+
+class KDTreeScratch:
+    """Balanced KD-tree with bounding-box pruning for exact nearest neighbors."""
+
+    def __init__(self, leaf_size: int = 16):
+        self.leaf_size = leaf_size
+
+    def fit(self, x: np.ndarray, y: np.ndarray) -> "KDTreeScratch":
+        self.x = np.asarray(x, dtype=float)
+        self.y = np.asarray(y, dtype=int)
+        self.root = self._build(np.arange(len(self.x)))
+        return self
+
+    def _build(self, indices: np.ndarray) -> dict[str, Any]:
+        points = self.x[indices]
+        node: dict[str, Any] = {"low": points.min(axis=0), "high": points.max(axis=0)}
+        if len(indices) <= self.leaf_size:
+            node["indices"] = indices
+            return node
+        axis = int(np.argmax(node["high"] - node["low"]))
+        order = indices[np.argsort(self.x[indices, axis], kind="mergesort")]
+        midpoint = len(order) // 2
+        node["left"] = self._build(order[:midpoint])
+        node["right"] = self._build(order[midpoint:])
+        return node
+
+    @staticmethod
+    def _box_distance_squared(point: np.ndarray, node: dict[str, Any]) -> float:
+        delta = np.maximum(np.maximum(node["low"] - point, point - node["high"]), 0.0)
+        return float(delta @ delta)
+
+    def query(self, point: np.ndarray, k: int) -> tuple[np.ndarray, np.ndarray]:
+        if k < 1 or k > len(self.x):
+            raise ValueError("k must be between 1 and the training row count")
+        nearest: list[tuple[float, int, int]] = []
+        self.last_nodes_visited = 0
+
+        def visit(node: dict[str, Any]) -> None:
+            self.last_nodes_visited += 1
+            if len(nearest) == k and self._box_distance_squared(point, node) > -nearest[0][0]:
+                return
+            if "indices" in node:
+                for index in node["indices"]:
+                    delta = point - self.x[index]
+                    distance_squared = float(delta @ delta)
+                    entry = (-distance_squared, -int(index), int(index))
+                    if len(nearest) < k:
+                        heapq.heappush(nearest, entry)
+                    elif entry > nearest[0]:
+                        heapq.heapreplace(nearest, entry)
+                return
+            children = [node["left"], node["right"]]
+            children.sort(key=lambda child: self._box_distance_squared(point, child))
+            visit(children[0])
+            visit(children[1])
+
+        visit(self.root)
+        ordered = sorted(nearest, key=lambda item: (-item[0], item[2]))
+        indices = np.array([item[2] for item in ordered], dtype=int)
+        distances = np.sqrt(np.array([-item[0] for item in ordered], dtype=float))
+        return indices, distances
+
+
+class KNearestNeighborsScratch:
+    """KD-tree-backed k-NN with deterministic, distance-aware vote tie breaks."""
+
+    def __init__(self, k: int = 5, leaf_size: int = 16):
+        self.k = k
+        self.leaf_size = leaf_size
+
+    def fit(self, x: np.ndarray, y: np.ndarray) -> "KNearestNeighborsScratch":
+        self.tree = KDTreeScratch(self.leaf_size).fit(x, y)
+        return self
+
+    def predict_one(self, point: np.ndarray) -> int:
+        indices, distances = self.tree.query(point, self.k)
+        labels = self.tree.y[indices]
+        values, counts = np.unique(labels, return_counts=True)
+        tied = values[counts == counts.max()]
+        if len(tied) == 1:
+            return int(tied[0])
+        distance_sums = {int(label): float(distances[labels == label].sum()) for label in tied}
+        smallest_sum = min(distance_sums.values())
+        closest = [label for label, total in distance_sums.items() if np.isclose(total, smallest_sum)]
+        if len(closest) == 1:
+            return closest[0]
+        nearest_label = int(labels[0])
+        return nearest_label if nearest_label in closest else min(closest)
+
+    def predict(self, x: np.ndarray) -> np.ndarray:
+        return np.array([self.predict_one(row) for row in x], dtype=int)
