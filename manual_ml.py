@@ -505,3 +505,152 @@ class KNearestNeighborsScratch:
 
     def predict(self, x: np.ndarray) -> np.ndarray:
         return np.array([self.predict_one(row) for row in x], dtype=int)
+
+
+class MLPClassifierScratch:
+    """Binary MLP with optional inverted dropout and manually differentiated batch normalization."""
+
+    def __init__(self, hidden_layers: tuple[int, ...] = (16, 8), learning_rate: float = 0.01, epochs: int = 100, batch_size: int = 32, dropout_rate: float = 0.0, batch_normalization: bool = False, seed: int = 42):
+        if not 0 <= dropout_rate < 1:
+            raise ValueError("dropout_rate must be in [0, 1)")
+        self.hidden_layers = hidden_layers
+        self.learning_rate = learning_rate
+        self.epochs = epochs
+        self.batch_size = batch_size
+        self.dropout_rate = dropout_rate
+        self.batch_normalization = batch_normalization
+        self.seed = seed
+
+    def fit(self, x: np.ndarray, y: np.ndarray) -> "MLPClassifierScratch":
+        rng = np.random.default_rng(self.seed)
+        layer_sizes = (x.shape[1], *self.hidden_layers, 1)
+        self.weights = [rng.normal(0, np.sqrt(2 / layer_sizes[i]), (layer_sizes[i], layer_sizes[i + 1])) for i in range(len(layer_sizes) - 1)]
+        self.biases = [np.zeros((1, layer_sizes[i + 1])) for i in range(len(layer_sizes) - 1)]
+        hidden_count = len(self.hidden_layers)
+        self.gamma = [np.ones((1, size)) for size in self.hidden_layers]
+        self.beta = [np.zeros((1, size)) for size in self.hidden_layers]
+        self.running_mean = [np.zeros((1, size)) for size in self.hidden_layers]
+        self.running_var = [np.ones((1, size)) for size in self.hidden_layers]
+        self.loss_history: list[float] = []
+        self.batch_variance_history: list[float] = []
+        epsilon, momentum = 1e-5, 0.9
+        labels = y.reshape(-1, 1).astype(float)
+
+        for _ in range(self.epochs):
+            order = rng.permutation(len(x))
+            epoch_loss = 0.0
+            for start in range(0, len(x), self.batch_size):
+                batch_idx = order[start:start + self.batch_size]
+                activations = [x[batch_idx]]
+                caches: list[dict[str, np.ndarray | None]] = []
+                for layer in range(hidden_count):
+                    linear = activations[-1] @ self.weights[layer] + self.biases[layer]
+                    if self.batch_normalization:
+                        mean = linear.mean(axis=0, keepdims=True)
+                        variance = linear.var(axis=0, keepdims=True)
+                        inverse_std = 1.0 / np.sqrt(variance + epsilon)
+                        normalized = (linear - mean) * inverse_std
+                        scaled = self.gamma[layer] * normalized + self.beta[layer]
+                        self.running_mean[layer] = momentum * self.running_mean[layer] + (1 - momentum) * mean
+                        self.running_var[layer] = momentum * self.running_var[layer] + (1 - momentum) * variance
+                        self.batch_variance_history.append(float(np.mean(variance)))
+                    else:
+                        normalized, inverse_std, scaled = linear, None, linear
+                    activated = np.maximum(scaled, 0.0)
+                    mask = None
+                    if self.dropout_rate and len(batch_idx) > 1:
+                        mask = (rng.random(activated.shape) >= self.dropout_rate).astype(float) / (1 - self.dropout_rate)
+                        activated = activated * mask
+                    caches.append({"normalized": normalized, "inverse_std": inverse_std, "scaled": scaled, "mask": mask})
+                    activations.append(activated)
+
+                logits = activations[-1] @ self.weights[-1] + self.biases[-1]
+                probabilities = 1.0 / (1.0 + np.exp(-np.clip(logits, -35, 35)))
+                batch_y = labels[batch_idx]
+                epoch_loss += float(-np.sum(batch_y * np.log(probabilities + 1e-12) + (1 - batch_y) * np.log(1 - probabilities + 1e-12)))
+                gradient = (probabilities - batch_y) / len(batch_idx)
+                weight_gradients = [None] * len(self.weights)
+                bias_gradients = [None] * len(self.biases)
+                gamma_gradients = [None] * hidden_count
+                beta_gradients = [None] * hidden_count
+                weight_gradients[-1] = activations[-1].T @ gradient
+                bias_gradients[-1] = gradient.sum(axis=0, keepdims=True)
+                gradient = gradient @ self.weights[-1].T
+
+                for layer in range(hidden_count - 1, -1, -1):
+                    cache = caches[layer]
+                    mask = cache["mask"]
+                    if mask is not None:
+                        gradient *= mask
+                    gradient *= cache["scaled"] > 0
+                    if self.batch_normalization:
+                        normalized = cache["normalized"]
+                        inverse_std = cache["inverse_std"]
+                        gamma_gradients[layer] = np.sum(gradient * normalized, axis=0, keepdims=True)
+                        beta_gradients[layer] = gradient.sum(axis=0, keepdims=True)
+                        normalized_gradient = gradient * self.gamma[layer]
+                        gradient = inverse_std / len(batch_idx) * (len(batch_idx) * normalized_gradient - normalized_gradient.sum(axis=0, keepdims=True) - normalized * np.sum(normalized_gradient * normalized, axis=0, keepdims=True))
+                    weight_gradients[layer] = activations[layer].T @ gradient
+                    bias_gradients[layer] = gradient.sum(axis=0, keepdims=True)
+                    gradient = gradient @ self.weights[layer].T
+
+                for layer in range(len(self.weights)):
+                    self.weights[layer] -= self.learning_rate * weight_gradients[layer]
+                    self.biases[layer] -= self.learning_rate * bias_gradients[layer]
+                if self.batch_normalization:
+                    for layer in range(hidden_count):
+                        self.gamma[layer] -= self.learning_rate * gamma_gradients[layer]
+                        self.beta[layer] -= self.learning_rate * beta_gradients[layer]
+            self.loss_history.append(epoch_loss / len(x))
+        return self
+
+    def predict_proba(self, x: np.ndarray) -> np.ndarray:
+        activation = x
+        for layer in range(len(self.hidden_layers)):
+            linear = activation @ self.weights[layer] + self.biases[layer]
+            if self.batch_normalization:
+                normalized = (linear - self.running_mean[layer]) / np.sqrt(self.running_var[layer] + 1e-5)
+                linear = self.gamma[layer] * normalized + self.beta[layer]
+            activation = np.maximum(linear, 0.0)
+        logits = activation @ self.weights[-1] + self.biases[-1]
+        return 1.0 / (1.0 + np.exp(-np.clip(logits.ravel(), -35, 35)))
+
+    def predict(self, x: np.ndarray, threshold: float = 0.5) -> np.ndarray:
+        return (self.predict_proba(x) >= threshold).astype(int)
+
+
+def architecture_features(architecture: tuple[int, ...]) -> np.ndarray:
+    padded = list(architecture[:3]) + [0] * (3 - len(architecture[:3]))
+    return np.array([len(architecture) / 3, *[width / 32 for width in padded]], dtype=float)
+
+
+def bayesian_architecture_search(candidates: list[tuple[int, ...]], objective, initial: list[tuple[int, ...]] | None = None, evaluations: int = 6, seed: int = 42) -> list[dict[str, float | tuple[int, ...]]]:
+    """Choose discrete architectures by Gaussian-process expected improvement."""
+    rng = np.random.default_rng(seed)
+    initial = initial or candidates[:2]
+    evaluated: list[dict[str, float | tuple[int, ...]]] = []
+    remaining = [candidate for candidate in candidates if candidate not in initial]
+    for architecture in initial[:evaluations]:
+        evaluated.append({"architecture": architecture, "score": float(objective(architecture))})
+    while remaining and len(evaluated) < evaluations:
+        observed_x = np.vstack([architecture_features(row["architecture"]) for row in evaluated])
+        observed_y = np.array([row["score"] for row in evaluated])
+        candidate_x = np.vstack([architecture_features(candidate) for candidate in remaining])
+        distances = np.sum((observed_x[:, None, :] - observed_x[None, :, :]) ** 2, axis=2)
+        kernel = np.exp(-0.5 * distances) + np.eye(len(observed_y)) * 1e-6
+        cross_distance = np.sum((candidate_x[:, None, :] - observed_x[None, :, :]) ** 2, axis=2)
+        cross_kernel = np.exp(-0.5 * cross_distance)
+        inverse = np.linalg.inv(kernel)
+        mean = cross_kernel @ inverse @ observed_y
+        variance = np.maximum(1.0 - np.sum((cross_kernel @ inverse) * cross_kernel, axis=1), 1e-9)
+        std = np.sqrt(variance)
+        best = float(np.max(observed_y))
+        z = (mean - best - 0.01) / std
+        cdf = 0.5 * (1 + np.vectorize(math.erf)(z / np.sqrt(2)))
+        pdf = np.exp(-0.5 * z ** 2) / np.sqrt(2 * np.pi)
+        expected_improvement = (mean - best - 0.01) * cdf + std * pdf
+        expected_improvement += rng.random(len(remaining)) * 1e-12
+        chosen_index = int(np.argmax(expected_improvement))
+        architecture = remaining.pop(chosen_index)
+        evaluated.append({"architecture": architecture, "score": float(objective(architecture))})
+    return evaluated
