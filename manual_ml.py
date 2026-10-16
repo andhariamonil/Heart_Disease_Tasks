@@ -521,7 +521,7 @@ class MLPClassifierScratch:
         self.batch_normalization = batch_normalization
         self.seed = seed
 
-    def fit(self, x: np.ndarray, y: np.ndarray) -> "MLPClassifierScratch":
+    def fit(self, x: np.ndarray, y: np.ndarray, validation_data: tuple[np.ndarray, np.ndarray] | None = None) -> "MLPClassifierScratch":
         rng = np.random.default_rng(self.seed)
         layer_sizes = (x.shape[1], *self.hidden_layers, 1)
         self.weights = [rng.normal(0, np.sqrt(2 / layer_sizes[i]), (layer_sizes[i], layer_sizes[i + 1])) for i in range(len(layer_sizes) - 1)]
@@ -532,6 +532,7 @@ class MLPClassifierScratch:
         self.running_mean = [np.zeros((1, size)) for size in self.hidden_layers]
         self.running_var = [np.ones((1, size)) for size in self.hidden_layers]
         self.loss_history: list[float] = []
+        self.validation_loss_history: list[float] = []
         self.batch_variance_history: list[float] = []
         epsilon, momentum = 1e-5, 0.9
         labels = y.reshape(-1, 1).astype(float)
@@ -602,6 +603,12 @@ class MLPClassifierScratch:
                         self.gamma[layer] -= self.learning_rate * gamma_gradients[layer]
                         self.beta[layer] -= self.learning_rate * beta_gradients[layer]
             self.loss_history.append(epoch_loss / len(x))
+            if validation_data is not None:
+                validation_x, validation_y = validation_data
+                validation_probabilities = np.clip(self.predict_proba(validation_x), 1e-12, 1 - 1e-12)
+                validation_y = validation_y.astype(float)
+                validation_loss = -np.mean(validation_y * np.log(validation_probabilities) + (1 - validation_y) * np.log(1 - validation_probabilities))
+                self.validation_loss_history.append(float(validation_loss))
         return self
 
     def predict_proba(self, x: np.ndarray) -> np.ndarray:
