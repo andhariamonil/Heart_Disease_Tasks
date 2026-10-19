@@ -54,6 +54,40 @@ def metrics(y_true: np.ndarray, y_pred: np.ndarray) -> dict[str, float]:
     }
 
 
+def manual_voting(probabilities: np.ndarray, weights: np.ndarray | None = None, mode: str = "soft", threshold: float = 0.5) -> tuple[np.ndarray, np.ndarray]:
+    """Combine rows of model probabilities with manually weighted hard or soft votes."""
+    if probabilities.ndim != 2 or probabilities.shape[0] == 0:
+        raise ValueError("probabilities must have shape (models, samples)")
+    if mode not in {"hard", "soft"}:
+        raise ValueError("mode must be 'hard' or 'soft'")
+    model_weights = np.ones(probabilities.shape[0]) if weights is None else np.asarray(weights, dtype=float)
+    if model_weights.shape != (probabilities.shape[0],) or np.any(model_weights < 0) or model_weights.sum() <= 0:
+        raise ValueError("weights must be nonnegative, match the model count, and have a positive sum")
+    normalized_weights = model_weights / model_weights.sum()
+    if mode == "soft":
+        combined_scores = normalized_weights @ probabilities
+    else:
+        hard_votes = (probabilities >= threshold).astype(float)
+        combined_scores = normalized_weights @ hard_votes
+        tied = np.isclose(combined_scores, 0.5)
+        if tied.any():
+            combined_scores[tied] = normalized_weights @ probabilities[:, tied]
+    return (combined_scores >= 0.5).astype(int), combined_scores
+
+
+def class_balanced_indices(labels: np.ndarray, seed: int = 42) -> np.ndarray:
+    """Return oversampled indices with equal representation for each observed class."""
+    rng = np.random.default_rng(seed)
+    classes, counts = np.unique(labels, return_counts=True)
+    if len(classes) < 2:
+        raise ValueError("at least two classes are required")
+    target_count = int(counts.max())
+    sampled = [rng.choice(np.flatnonzero(labels == label), size=target_count, replace=count < target_count) for label, count in zip(classes, counts)]
+    indices = np.concatenate(sampled)
+    rng.shuffle(indices)
+    return indices
+
+
 def standardize_fit(x: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     means = x.mean(axis=0)
     scales = x.std(axis=0)
