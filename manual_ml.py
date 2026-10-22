@@ -555,7 +555,7 @@ class MLPClassifierScratch:
         self.batch_normalization = batch_normalization
         self.seed = seed
 
-    def fit(self, x: np.ndarray, y: np.ndarray, validation_data: tuple[np.ndarray, np.ndarray] | None = None) -> "MLPClassifierScratch":
+    def fit(self, x: np.ndarray, y: np.ndarray, validation_data: tuple[np.ndarray, np.ndarray] | None = None, scheduler: dict[str, float | int] | None = None) -> "MLPClassifierScratch":
         rng = np.random.default_rng(self.seed)
         layer_sizes = (x.shape[1], *self.hidden_layers, 1)
         self.weights = [rng.normal(0, np.sqrt(2 / layer_sizes[i]), (layer_sizes[i], layer_sizes[i + 1])) for i in range(len(layer_sizes) - 1)]
@@ -567,11 +567,24 @@ class MLPClassifierScratch:
         self.running_var = [np.ones((1, size)) for size in self.hidden_layers]
         self.loss_history: list[float] = []
         self.validation_loss_history: list[float] = []
+        self.learning_rate_history: list[float] = []
+        self.scheduler_events: list[dict[str, float | int]] = []
+        self.update_norm_history: list[float] = []
         self.batch_variance_history: list[float] = []
         epsilon, momentum = 1e-5, 0.9
         labels = y.reshape(-1, 1).astype(float)
+        best_validation_loss = float("inf")
+        epochs_without_improvement = 0
+        scheduler_factor = float(scheduler.get("factor", 0.5)) if scheduler else 0.5
+        scheduler_patience = int(scheduler.get("patience", 5)) if scheduler else 5
+        scheduler_min_delta = float(scheduler.get("min_delta", 1e-4)) if scheduler else 1e-4
+        scheduler_min_rate = float(scheduler.get("min_learning_rate", 1e-4)) if scheduler else 1e-4
+        if scheduler and (not 0 < scheduler_factor < 1 or scheduler_patience < 1):
+            raise ValueError("scheduler factor must be in (0, 1) and patience must be positive")
 
         for _ in range(self.epochs):
+            epoch_learning_rate = self.learning_rate
+            epoch_update_squared = 0.0
             order = rng.permutation(len(x))
             epoch_loss = 0.0
             for start in range(0, len(x), self.batch_size):
@@ -630,19 +643,35 @@ class MLPClassifierScratch:
                     gradient = gradient @ self.weights[layer].T
 
                 for layer in range(len(self.weights)):
-                    self.weights[layer] -= self.learning_rate * weight_gradients[layer]
-                    self.biases[layer] -= self.learning_rate * bias_gradients[layer]
+                    epoch_update_squared += float(np.sum((epoch_learning_rate * weight_gradients[layer]) ** 2) + np.sum((epoch_learning_rate * bias_gradients[layer]) ** 2))
+                    self.weights[layer] -= epoch_learning_rate * weight_gradients[layer]
+                    self.biases[layer] -= epoch_learning_rate * bias_gradients[layer]
                 if self.batch_normalization:
                     for layer in range(hidden_count):
-                        self.gamma[layer] -= self.learning_rate * gamma_gradients[layer]
-                        self.beta[layer] -= self.learning_rate * beta_gradients[layer]
+                        epoch_update_squared += float(np.sum((epoch_learning_rate * gamma_gradients[layer]) ** 2) + np.sum((epoch_learning_rate * beta_gradients[layer]) ** 2))
+                        self.gamma[layer] -= epoch_learning_rate * gamma_gradients[layer]
+                        self.beta[layer] -= epoch_learning_rate * beta_gradients[layer]
             self.loss_history.append(epoch_loss / len(x))
+            self.learning_rate_history.append(epoch_learning_rate)
+            self.update_norm_history.append(float(np.sqrt(epoch_update_squared)))
             if validation_data is not None:
                 validation_x, validation_y = validation_data
                 validation_probabilities = np.clip(self.predict_proba(validation_x), 1e-12, 1 - 1e-12)
                 validation_y = validation_y.astype(float)
                 validation_loss = -np.mean(validation_y * np.log(validation_probabilities) + (1 - validation_y) * np.log(1 - validation_probabilities))
                 self.validation_loss_history.append(float(validation_loss))
+                if scheduler:
+                    if validation_loss < best_validation_loss - scheduler_min_delta:
+                        best_validation_loss = float(validation_loss)
+                        epochs_without_improvement = 0
+                    else:
+                        epochs_without_improvement += 1
+                    if epochs_without_improvement >= scheduler_patience:
+                        next_rate = max(scheduler_min_rate, self.learning_rate * scheduler_factor)
+                        if next_rate < self.learning_rate:
+                            self.learning_rate = next_rate
+                            self.scheduler_events.append({"epoch": len(self.loss_history), "learning_rate": next_rate, "validation_loss": float(validation_loss)})
+                        epochs_without_improvement = 0
         return self
 
     def predict_proba(self, x: np.ndarray) -> np.ndarray:
