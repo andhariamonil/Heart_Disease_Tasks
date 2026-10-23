@@ -88,6 +88,75 @@ def class_balanced_indices(labels: np.ndarray, seed: int = 42) -> np.ndarray:
     return indices
 
 
+def exact_shapley_values(predict_function, instance: np.ndarray, background: np.ndarray, batch_size: int = 256) -> tuple[float, np.ndarray]:
+    """Compute exact interventional Shapley values by enumerating feature coalitions."""
+    instance = np.asarray(instance, dtype=float).reshape(-1)
+    background = np.asarray(background, dtype=float)
+    if background.ndim != 2 or background.shape[1] != len(instance) or len(background) == 0:
+        raise ValueError("background must be a nonempty matrix matching the instance feature count")
+    feature_count = len(instance)
+    if feature_count > 16:
+        raise ValueError("exact coalition enumeration is limited to 16 features")
+    coalition_count = 1 << feature_count
+    feature_bits = 1 << np.arange(feature_count)
+    mask_ids = np.arange(coalition_count, dtype=np.int64)
+    mask_matrix = (mask_ids[:, None] & feature_bits[None, :]) != 0
+    coalition_values = np.empty(coalition_count, dtype=float)
+    for start in range(0, coalition_count, batch_size):
+        stop = min(start + batch_size, coalition_count)
+        coalition_masks = mask_matrix[start:stop]
+        hybrid = np.where(coalition_masks[:, None, :], instance[None, None, :], background[None, :, :])
+        predictions = np.asarray(predict_function(hybrid.reshape(-1, feature_count)), dtype=float).reshape(stop - start, len(background))
+        coalition_values[start:stop] = predictions.mean(axis=1)
+    factorial = math.factorial
+    denominator = factorial(feature_count)
+    attributions = np.zeros(feature_count, dtype=float)
+    for feature in range(feature_count):
+        bit = 1 << feature
+        eligible = mask_ids[(mask_ids & bit) == 0]
+        sizes = np.array([int(mask).bit_count() for mask in eligible])
+        weights = np.array([factorial(int(size)) * factorial(feature_count - int(size) - 1) / denominator for size in sizes])
+        attributions[feature] = np.sum(weights * (coalition_values[eligible | bit] - coalition_values[eligible]))
+    return float(coalition_values[0]), attributions
+
+
+def lime_perturbations(instance: np.ndarray, background: np.ndarray, sample_count: int = 1000, seed: int = 42) -> np.ndarray:
+    """Create tabular LIME samples by independently drawing observed feature values."""
+    instance = np.asarray(instance, dtype=float).reshape(-1)
+    background = np.asarray(background, dtype=float)
+    if background.ndim != 2 or background.shape[1] != len(instance) or len(background) == 0:
+        raise ValueError("background must be a nonempty matrix matching the instance feature count")
+    rng = np.random.default_rng(seed)
+    row_indices = rng.integers(0, len(background), size=(sample_count, len(instance)))
+    columns = np.arange(len(instance))[None, :]
+    perturbed = background[row_indices, columns]
+    perturbed[0] = instance
+    return perturbed
+
+
+def fit_lime_surrogate(perturbed: np.ndarray, predictions: np.ndarray, weights: np.ndarray, ridge: float = 1e-3) -> tuple[float, np.ndarray, float]:
+    """Fit a local weighted linear surrogate and return intercept, coefficients, and weighted R-squared."""
+    perturbed = np.asarray(perturbed, dtype=float)
+    predictions = np.asarray(predictions, dtype=float).reshape(-1)
+    weights = np.asarray(weights, dtype=float).reshape(-1)
+    if perturbed.ndim != 2 or len(perturbed) != len(predictions) or len(weights) != len(predictions):
+        raise ValueError("perturbed rows, predictions, and weights must have matching lengths")
+    design = np.column_stack([np.ones(len(perturbed)), perturbed])
+    root_weights = np.sqrt(np.maximum(weights, 0.0))
+    weighted_design = design * root_weights[:, None]
+    weighted_targets = predictions * root_weights
+    penalty = np.eye(design.shape[1]) * ridge
+    penalty[0, 0] = 0.0
+    coefficients = np.linalg.solve(weighted_design.T @ weighted_design + penalty, weighted_design.T @ weighted_targets)
+    fitted = design @ coefficients
+    total_weight = weights.sum()
+    mean = float(np.sum(weights * predictions) / total_weight) if total_weight else float(predictions.mean())
+    residual_sum = float(np.sum(weights * (predictions - fitted) ** 2))
+    total_sum = float(np.sum(weights * (predictions - mean) ** 2))
+    weighted_r2 = 1.0 - residual_sum / total_sum if total_sum > 1e-15 else 1.0
+    return float(coefficients[0]), coefficients[1:], weighted_r2
+
+
 def standardize_fit(x: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     means = x.mean(axis=0)
     scales = x.std(axis=0)
