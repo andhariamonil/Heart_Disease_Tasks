@@ -179,14 +179,19 @@ class LogisticRegressionScratch:
         z = np.clip(z, -35, 35)
         return 1.0 / (1.0 + np.exp(-z))
 
-    def fit(self, x: np.ndarray, y: np.ndarray) -> "LogisticRegressionScratch":
+    def fit(self, x: np.ndarray, y: np.ndarray, sample_weight: np.ndarray | None = None) -> "LogisticRegressionScratch":
         self.weights = np.zeros(x.shape[1], dtype=float)
         self.bias = 0.0
+        weights = np.ones(len(y), dtype=float) if sample_weight is None else np.asarray(sample_weight, dtype=float)
+        if weights.shape != (len(y),) or np.any(weights < 0) or not np.isfinite(weights).all() or weights.sum() <= 0:
+            raise ValueError("sample_weight must be finite, nonnegative, match y, and have a positive sum")
+        weights = weights / weights.sum()
         for _ in range(self.iterations):
             probabilities = self._sigmoid(x @ self.weights + self.bias)
             error = probabilities - y
-            self.weights -= self.learning_rate * (x.T @ error / len(y) + self.l2 * self.weights)
-            self.bias -= self.learning_rate * float(error.mean())
+            weighted_error = weights * error
+            self.weights -= self.learning_rate * (x.T @ weighted_error + self.l2 * self.weights)
+            self.bias -= self.learning_rate * float(weighted_error.sum())
         return self
 
     def predict_proba(self, x: np.ndarray) -> np.ndarray:
