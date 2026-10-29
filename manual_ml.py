@@ -798,3 +798,42 @@ def bayesian_architecture_search(candidates: list[tuple[int, ...]], objective, i
         architecture = remaining.pop(chosen_index)
         evaluated.append({"architecture": architecture, "score": float(objective(architecture))})
     return evaluated
+
+
+def custom_kfold_split(n_samples: int, k: int = 5, shuffle: bool = True, seed: int = 42) -> list[tuple[np.ndarray, np.ndarray]]:
+    """Partition n_samples into k folds, returning list of (train_indices, val_indices)."""
+    if k < 2 or k > n_samples:
+        raise ValueError("k must be between 2 and n_samples")
+    rng = np.random.default_rng(seed)
+    indices = rng.permutation(n_samples) if shuffle else np.arange(n_samples)
+    folds = np.array_split(indices, k)
+    splits = []
+    all_indices = np.arange(n_samples)
+    for i in range(k):
+        val_idx = folds[i]
+        train_idx = np.setdiff1d(all_indices, val_idx)
+        splits.append((train_idx, val_idx))
+    return splits
+
+
+def custom_stratified_kfold_split(y: np.ndarray, k: int = 5, shuffle: bool = True, seed: int = 42) -> list[tuple[np.ndarray, np.ndarray]]:
+    """Partition y into k stratified folds preserving class proportions in each fold."""
+    if k < 2 or k > len(y):
+        raise ValueError("k must be between 2 and sample count")
+    rng = np.random.default_rng(seed)
+    folds: list[list[int]] = [[] for _ in range(k)]
+    for label in np.unique(y):
+        cls_indices = np.flatnonzero(y == label)
+        if shuffle:
+            rng.shuffle(cls_indices)
+        cls_folds = np.array_split(cls_indices, k)
+        for i in range(k):
+            folds[i].extend(cls_folds[i])
+    splits = []
+    all_indices = np.arange(len(y))
+    for i in range(k):
+        val_idx = np.array(folds[i], dtype=int)
+        train_idx = np.setdiff1d(all_indices, val_idx)
+        splits.append((train_idx, val_idx))
+    return splits
+
