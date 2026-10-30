@@ -5,6 +5,8 @@ from __future__ import annotations
 import heapq
 import math
 import random
+import threading
+from collections import OrderedDict
 from pathlib import Path
 from typing import Any
 
@@ -836,4 +838,164 @@ def custom_stratified_kfold_split(y: np.ndarray, k: int = 5, shuffle: bool = Tru
         train_idx = np.setdiff1d(all_indices, val_idx)
         splits.append((train_idx, val_idx))
     return splits
+
+
+FEATURE_SPECS: dict[str, dict[str, Any]] = {
+    "age": {"type": float, "min": 18.0, "max": 100.0, "default": 55.0, "categorical": False},
+    "sex": {"type": int, "allowed": [0, 1], "default": 1, "categorical": True},
+    "cp": {"type": int, "allowed": [0, 1, 2, 3], "default": 0, "categorical": True},
+    "trestbps": {"type": float, "min": 80.0, "max": 240.0, "default": 130.0, "categorical": False},
+    "chol": {"type": float, "min": 100.0, "max": 600.0, "default": 240.0, "categorical": False},
+    "fbs": {"type": int, "allowed": [0, 1], "default": 0, "categorical": True},
+    "restecg": {"type": int, "allowed": [0, 1, 2], "default": 0, "categorical": True},
+    "thalach": {"type": float, "min": 60.0, "max": 220.0, "default": 150.0, "categorical": False},
+    "exang": {"type": int, "allowed": [0, 1], "default": 0, "categorical": True},
+    "oldpeak": {"type": float, "min": 0.0, "max": 10.0, "default": 1.0, "categorical": False},
+    "slope": {"type": int, "allowed": [0, 1, 2], "default": 1, "categorical": True},
+    "ca": {"type": int, "allowed": [0, 1, 2, 3, 4], "default": 0, "categorical": True},
+    "thal": {"type": int, "allowed": [0, 1, 2, 3], "default": 2, "categorical": True},
+}
+
+
+def validate_and_impute_input(
+    raw: dict[str, Any],
+    specs: dict[str, dict[str, Any]] | None = None
+) -> tuple[dict[str, float], list[str], list[str]]:
+    """Validate raw user inputs against physiological specs, impute missing values, and report issues."""
+    active_specs = specs or FEATURE_SPECS
+    clean: dict[str, float] = {}
+    warnings: list[str] = []
+    errors: list[str] = []
+
+    for feat, spec in active_specs.items():
+        val = raw.get(feat, None)
+        if val is None or val == "" or (isinstance(val, float) and np.isnan(val)):
+            default_val = spec["default"]
+            clean[feat] = float(default_val)
+            warnings.append(f"Missing {feat}: automatically imputed to default ({default_val})")
+            continue
+
+        try:
+            parsed = float(val)
+        except (ValueError, TypeError):
+            default_val = spec["default"]
+            clean[feat] = float(default_val)
+            errors.append(f"Invalid non-numeric value for {feat} ({val!r}): fallback to default ({default_val})")
+            continue
+
+        if spec["categorical"]:
+            parsed_int = int(round(parsed))
+            if parsed_int not in spec["allowed"]:
+                closest = min(spec["allowed"], key=lambda a: abs(a - parsed_int))
+                clean[feat] = float(closest)
+                warnings.append(f"Categorical {feat} ({val}) out of allowed set {spec['allowed']}: clipped to {closest}")
+            else:
+                clean[feat] = float(parsed_int)
+        else:
+            if parsed < spec["min"]:
+                clean[feat] = float(spec["min"])
+                warnings.append(f"{feat} ({parsed}) below minimum physiological bound {spec['min']}: clipped to {spec['min']}")
+            elif parsed > spec["max"]:
+                clean[feat] = float(spec["max"])
+                warnings.append(f"{feat} ({parsed}) exceeds maximum physiological bound {spec['max']}: clipped to {spec['max']}")
+            else:
+                clean[feat] = float(parsed)
+
+    if "age" in clean and "thalach" in clean:
+        max_pred_hr = 220.0 - clean["age"]
+        if clean["thalach"] > max_pred_hr + 15:
+            warnings.append(f"Clinical Alert: Max heart rate ({clean['thalach']:.0f}) significantly exceeds theoretical age-predicted max ({max_pred_hr:.0f} bpm)")
+
+    return clean, warnings, errors
+
+
+def fast_vectorize_input(clean: dict[str, float], feature_order: list[str], means: np.ndarray, scales: np.ndarray) -> np.ndarray:
+    """Fast vectorized conversion of validated dictionary to standardized 2D NumPy array."""
+    raw_array = np.array([clean[f] for f in feature_order], dtype=float)
+    return (raw_array - means) / scales
+
+
+class ThreadSafeLRUCache:
+    """Thread-safe LRU cache with deterministic feature vector key hashing and operational telemetry."""
+
+    def __init__(self, capacity: int = 256):
+        self.capacity = capacity
+        self.cache: OrderedDict[int, Any] = OrderedDict()
+        self.lock = threading.RLock()
+        self.hits = 0
+        self.misses = 0
+        self.evictions = 0
+
+    @staticmethod
+    def hash_vector(vector: np.ndarray | list[float], precision: int = 2) -> int:
+        flattened = np.asarray(vector).ravel()
+        rounded = tuple(round(float(v), precision) for v in flattened)
+        return hash(rounded)
+
+    def get(self, key: int) -> Any | None:
+        with self.lock:
+            if key in self.cache:
+                self.hits += 1
+                self.cache.move_to_end(key)
+                return self.cache[key]
+            self.misses += 1
+            return None
+
+    def put(self, key: int, value: Any) -> None:
+        with self.lock:
+            if key in self.cache:
+                self.cache.move_to_end(key)
+            self.cache[key] = value
+            if len(self.cache) > self.capacity:
+                self.cache.popitem(last=False)
+                self.evictions += 1
+
+    def stats(self) -> dict[str, float | int]:
+        with self.lock:
+            total = self.hits + self.misses
+            hit_rate = self.hits / total if total > 0 else 0.0
+            return {
+                "size": len(self.cache),
+                "capacity": self.capacity,
+                "hits": self.hits,
+                "misses": self.misses,
+                "hit_rate": hit_rate,
+                "evictions": self.evictions,
+            }
+
+    def clear(self) -> None:
+        with self.lock:
+            self.cache.clear()
+            self.hits = 0
+            self.misses = 0
+            self.evictions = 0
+
+
+def compute_confidence_distribution(prob_presence: float) -> dict[str, Any]:
+    """Manually compute probability distribution, confidence margin, Shannon entropy, and tier."""
+    p1 = float(np.clip(prob_presence, 1e-7, 1.0 - 1e-7))
+    p0 = 1.0 - p1
+    margin = abs(p1 - 0.5) * 2.0
+    entropy = float(-(p0 * np.log2(p0) + p1 * np.log2(p1)))
+    confidence = max(p0, p1)
+    predicted_class = 1 if p1 >= 0.5 else 0
+
+    if confidence >= 0.80:
+        tier = "High Confidence"
+    elif confidence >= 0.60:
+        tier = "Moderate Confidence"
+    else:
+        tier = "Low / Borderline Confidence"
+
+    return {
+        "p0": p0,
+        "p1": p1,
+        "distribution": {"Absence (0)": p0, "Presence (1)": p1},
+        "predicted_class": predicted_class,
+        "confidence": confidence,
+        "margin": margin,
+        "entropy": entropy,
+        "tier": tier,
+    }
+
 
