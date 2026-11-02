@@ -999,3 +999,35 @@ def compute_confidence_distribution(prob_presence: float) -> dict[str, Any]:
     }
 
 
+def compute_linear_shap(model, x_scaled: np.ndarray, feature_names: list[str]) -> dict[str, Any]:
+    """Compute exact additive feature attributions (SHAP) on the logit scale for linear/logistic models."""
+    x_1d = np.asarray(x_scaled, dtype=float).ravel()
+    weights = np.asarray(model.weights, dtype=float).ravel()
+    bias = float(model.bias)
+
+    contributions = weights * x_1d
+    total_logit = bias + float(np.sum(contributions))
+    pred_prob = 1.0 / (1.0 + np.exp(-np.clip(total_logit, -35.0, 35.0)))
+    base_prob = 1.0 / (1.0 + np.exp(-np.clip(bias, -35.0, 35.0)))
+
+    records = []
+    for name, w, val, phi in zip(feature_names, weights, x_1d, contributions):
+        records.append({
+            "feature": name,
+            "weight": float(w),
+            "scaled_val": float(val),
+            "attribution": float(phi),
+            "direction": "Pushes to Disease (+)" if phi > 0 else ("Pushes to Healthy (-)" if phi < 0 else "Neutral"),
+            "abs_impact": abs(float(phi)),
+        })
+    records.sort(key=lambda r: r["abs_impact"], reverse=True)
+
+    return {
+        "base_logit": bias,
+        "base_prob": base_prob,
+        "total_logit": total_logit,
+        "pred_prob": pred_prob,
+        "attributions": {r["feature"]: r["attribution"] for r in records},
+        "ranked_features": records,
+    }
+
