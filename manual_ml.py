@@ -56,6 +56,50 @@ def metrics(y_true: np.ndarray, y_pred: np.ndarray) -> dict[str, float]:
     }
 
 
+def validate_input_row(values: dict[str, Any], feature_names: list[str], categorical_values: dict[str, list[int]], hard_ranges: dict[str, tuple[float, float]], learned_ranges: dict[str, tuple[float, float]]) -> tuple[dict[str, float], list[dict[str, Any]], dict[str, float]]:
+    """Validate a user-entered row and return parsed values, contextual issues, and explicit suggestions."""
+    parsed: dict[str, float] = {}
+    issues: list[dict[str, Any]] = []
+    suggestions: dict[str, float] = {}
+    missing_features = [name for name in feature_names if name not in values]
+    for name in missing_features:
+        issues.append({"feature": name, "level": "error", "message": "This required feature is missing.", "suggestion": None})
+    for name in feature_names:
+        if name not in values:
+            continue
+        raw = values[name]
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            issues.append({"feature": name, "level": "error", "message": "Enter a numeric value.", "suggestion": None})
+            continue
+        if not math.isfinite(value):
+            issues.append({"feature": name, "level": "error", "message": "Value must be finite; NaN and infinity are not accepted.", "suggestion": None})
+            continue
+        parsed[name] = value
+        if name in categorical_values:
+            allowed = categorical_values[name]
+            if not float(value).is_integer() or int(value) not in allowed:
+                suggestion = float(min(allowed, key=lambda option: (abs(option - value), option)))
+                suggestions[name] = suggestion
+                issues.append({"feature": name, "level": "error", "message": f"Expected one of the observed integer codes {allowed}.", "suggestion": suggestion})
+                continue
+        if name in hard_ranges:
+            lower, upper = hard_ranges[name]
+            if value < lower or value > upper:
+                suggestion = float(np.clip(value, lower, upper))
+                suggestions[name] = suggestion
+                issues.append({"feature": name, "level": "error", "message": f"Outside the configured plausible interval [{lower:g}, {upper:g}].", "suggestion": suggestion})
+                continue
+        if name in learned_ranges:
+            lower, upper = learned_ranges[name]
+            if value < lower or value > upper:
+                suggestion = float(np.clip(value, lower, upper))
+                suggestions[name] = suggestion
+                issues.append({"feature": name, "level": "warning", "message": f"Outside the training 1st–99th percentile range [{lower:.3g}, {upper:.3g}]; this may be an uncommon but valid case.", "suggestion": suggestion})
+    return parsed, issues, suggestions
+
+
 def manual_voting(probabilities: np.ndarray, weights: np.ndarray | None = None, mode: str = "soft", threshold: float = 0.5) -> tuple[np.ndarray, np.ndarray]:
     """Combine rows of model probabilities with manually weighted hard or soft votes."""
     if probabilities.ndim != 2 or probabilities.shape[0] == 0:
