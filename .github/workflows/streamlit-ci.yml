@@ -1,0 +1,32 @@
+name: Streamlit Cloud CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            Task_78_AWS_API_Deployment/requirements.txt
+      - name: Install deployment dependencies
+        run: python -m pip install -r requirements.txt -r Task_78_AWS_API_Deployment/requirements.txt pytest httpx
+      - name: Compile Streamlit and API code
+        run: python -m compileall -q manual_ml.py Task_76_Accessible_Custom_CSS_Dashboard/app.py Task_78_AWS_API_Deployment/app.py
+      - name: Test protected API
+        env:
+          API_BEARER_TOKEN: ci-test-token-with-sufficient-length-000000000000
+          MODEL_ARTIFACT_PATH: Task_47_Versioned_Model_Export/artifacts/heart_logistic_v1.0.0.joblib
+        run: pytest -q Task_78_AWS_API_Deployment/test_api.py Task_77_Streamlit_Cloud_CICD/test_streamlit_dashboard.py

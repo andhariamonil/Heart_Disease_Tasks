@@ -1,0 +1,9 @@
+.git
+.venv
+**/__pycache__
+**/*.pyc
+**/*.ipynb
+**/heart.csv
+**/processed_heart.csv
+Task_47_Versioned_Model_Export/artifacts/*.joblib
+!Task_47_Versioned_Model_Export/artifacts/heart_logistic_v1.0.0.joblib

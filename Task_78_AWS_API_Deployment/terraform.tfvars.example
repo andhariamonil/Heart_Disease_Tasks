@@ -1,0 +1,11 @@
+aws_region            = "us-east-1"
+vpc_id                = "vpc-REPLACE_ME"
+public_subnet_ids     = ["subnet-PUBLIC_A", "subnet-PUBLIC_B"]
+private_subnet_ids    = ["subnet-PRIVATE_A", "subnet-PRIVATE_B"]
+certificate_arn       = "arn:aws:acm:us-east-1:123456789012:certificate/REPLACE_ME"
+api_domain            = "api.example.com"
+api_token_secret_arn  = "arn:aws:secretsmanager:us-east-1:123456789012:secret:heart-api-token-REPLACE_ME"
+image_uri             = "123456789012.dkr.ecr.us-east-1.amazonaws.com/heart-model-api:1.0.0"
+desired_count         = 2
+min_capacity          = 2
+max_capacity          = 10
