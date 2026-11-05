@@ -24,7 +24,7 @@ jobs:
       - name: Install deployment dependencies
         run: python -m pip install -r requirements.txt -r Task_78_AWS_API_Deployment/requirements.txt pytest httpx
       - name: Compile Streamlit and API code
-        run: python -m compileall -q manual_ml.py Task_76_Accessible_Custom_CSS_Dashboard/app.py Task_78_AWS_API_Deployment/app.py
+        run: python -m compileall -q manual_ml.py Task_76_Accessible_Custom_CSS_Dashboard/app.py Task_78_AWS_API_Deployment/app.py Task_80_API_Latency_Profiling/app.py Task_81_Final_Project_Implementation_Report/app.py Task_82_Manual_Multiple_Imputation/app.py
       - name: Test protected API
         env:
           API_BEARER_TOKEN: ci-test-token-with-sufficient-length-000000000000
